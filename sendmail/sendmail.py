@@ -1,46 +1,58 @@
 #!/usr/bin/env python3
 
 import re
+import os
 import smtplib
 import mimetypes
-import sys
+import argparse
+import importlib.util
+from collections import deque
 from time import sleep
+from contextlib import closing
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.utils import formataddr
 from email.header import Header
 
-import config
 
-account = config.accounts[0]
+def _cat(fname, mode='r'):
+    """读取文件 fname 的内容"""
+    with open(fname, mode) as fp:
+        return fp.read()
 
-def read_receivers(address_file):
-    with open(address_file) as fp:
-        return [addr.strip() for addr in fp.readlines()]
+
+def _parse_and_read(string, mode='r', prefix='@'):
+    """如果 string 以 prefix 作为前缀，
+    那么读取 string 去掉 prefix 前缀后的文件的内容
+    否则，直接返回 string
+    """
+    if not string.startswith(prefix):
+        return string
+    return _cat(string.lstrip(prefix), mode)
+
 
 class Message:
-    def __init__(self, from_, subject, context, attaches=None, reply_to='icacia@uestc.edu.cn'):
+    """邮件正文内容"""
+    def __init__(self, from_, subject, context, attaches=None, reply_to=None):
         sender_info = re.match(r'\s*(.+?)\s*<([-_\w.]+@[-_\w.]+\.\w+)>', from_)
         sender_name = sender_info[1]
         sender_addr = sender_info[2]
         message = MIMEMultipart()
         message['From'] = formataddr([sender_name, sender_addr])
         message['Subject'] = Header(subject)
-        message['Reply-To'] = reply_to
+        message['Reply-To'] = reply_to if reply_to else sender_addr
 
         # 正文
-        with open(context, 'r') as fp:
-            message.attach(MIMEText(fp.read(), 'plain', 'utf-8'))
+        message.attach(MIMEText(context, 'plain', 'utf-8'))
 
         # 附件
         attaches = attaches or []
-        for attach_file in attaches:
-            with open(attach_file, 'rb') as fp:
-                attach = MIMEText(fp.read(), 'base64', 'utf-8')
-                # replace default Content-Type 'text/base64; charset=utf-8' to file mimetype
-                attach.replace_header('Content-Type', mimetypes.guess_type(attach_file)[0])
-                attach['Content-Disposition'] = 'attachment; filename="{}"'.format(attach_file)
-                message.attach(attach)
+        for attach_path in attaches:
+            attach = MIMEText(_cat(attach_path, 'rb'), 'base64', 'utf-8')
+            # replace default Content-Type 'text/base64; charset=utf-8' to file mimetype
+            attach.replace_header('Content-Type', mimetypes.guess_type(attach_path)[0])
+            attach['Content-Disposition'] = 'attachment; filename="{}"'.format(os.path.basename(attach_path))
+            message.attach(attach)
 
         self._message = message
 
@@ -60,88 +72,231 @@ class Smtp:
     def __init__(self, account):
         self._account = account
         self._emails_per_connection = 5
-        self._login()
+        self._emails_on_connection = 0
+        self._closed = True
 
     def _login(self):
-        self._closed = False
         self._smtp = smtplib.SMTP(self._account['smtp_server'], self._account['smtp_port'])
         self._smtp.login(self._account['user'], self._account['password'])
-        self._emails_on_connection = 0
+        self._closed = False
 
     def _relogin(self):
         self.close()
         self._login()
+
+    @property
+    def sender(self):
+        return self._account['sender']
 
     def sendmail(self, to_addr, msg):
         if self._closed:
             self._login()
         if self._emails_on_connection >= self._emails_per_connection:
             self._relogin()
+        self._emails_on_connection += 1
         try:
-            self._emails_on_connection += 1
-            self._smtp.sendmail(self._account['addr'], to_addr, msg)
+            self._smtp.sendmail(self.sender, to_addr, msg)
         except smtplib.SMTPResponseException as e:
+            self._emails_on_connection += 1
             self.close()
             raise e
 
     def close(self):
+        if not self._closed:
+            self._smtp.close()
         self._closed = True
-        self._smtp.close()
-
-def main(addresses=None):
-    if not addresses:
-        addresses = './address.txt'
-    subject = '[请补充发票信息] 2020 the 17th ICCWAMTIP Conference'
-    context = './copyright.msg'
-    #attaches = []
-
-    receivers = read_receivers(addresses)
-    message = Message(account['from'], subject, context)
-
-    WAIT_TIME = 1*60
-    wait_time = WAIT_TIME
-
-    time_out = 1
-    fail_cnt = 0
-    sucess_cnt = 0
-    force_quit = False
-
-    smtp = Smtp(account)
-
-    idx = 0
-    while idx < len(receivers) and not force_quit:
-        receiver = receivers[idx]
-        try:
-            smtp.sendmail(receiver, message.to(receiver).as_string())
-            print("{}. send email to {}".format(idx, receiver))
-            sucess_cnt += 1
-            time_out = 1
-            wait_time = WAIT_TIME
-        except smtplib.SMTPException as e:
-            print("{}. send email to {} fail".format(idx, receiver), e)
-            print("  {}. wait {} seconds try again ...".format(idx, wait_time))
-            idx -= 1
-            time_out = wait_time
-            wait_time *= 2
-
-        idx += 1
-
-        try:
-            sleep(time_out)
-        except (InterruptedError, KeyboardInterrupt):
-            force_quit = True
 
 
-    smtp.close()
-    print("send over. sucess: {}/{}".format(sucess_cnt, idx))
+class Task:
+    def __init__(self, cfg, workdir):
+        self._workdir = workdir
+        self._email = cfg.email
+        self._accounts = cfg.accounts
+        self._receivers = deque(Task._merge_receivers(cfg.address))
+        self._sent = set()
+        self._message = Message(self._email['from'], self._email['subject'],
+                _parse_and_read(self._email['context']),
+                self._email['attaches'], self._email['reply-to'])
+        self._wait_time = 1*60  # 所有账户都发送失败，然后等待 1 分钟然后再重试
+        self._time_out = 1      # 每封邮件之间发送等待间隔 1 秒钟
+        self._log_fp = open(os.path.join(workdir, 'log.txt'), 'a')
+
+    @staticmethod
+    def load_config(path):
+        task_path = os.path.join(path, 'task.py')
+        spec = importlib.util.spec_from_file_location('module.name', task_path)
+        task = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(task)
+        # 修正路径，添加前缀
+        if task.email['context'].startswith('@'):
+            task.email['context'] = '@' + os.path.join(path, task.email['context'][1:])
+        task.email['attaches'] = [os.path.join(path, attach) for attach in task.email['attaches']]
+        addresses = []
+        for file in task.address:
+            if file.startswith('@'):
+                addresses.append('@' + os.path.join(path, file[1:]))
+            else:
+                addresses.append(file)
+        task.address = addresses
+        return task
+
+    def run(self):
+        no = len(self._sent)+1
+        idx = 0
+        suspend_accounts = set()
+        wait_time = self._wait_time
+        sent_cnt = 0
+        force_quit = False
+        while self._receivers and not force_quit:
+            if len(suspend_accounts) == len(self._accounts):
+                suspend_accounts.clear()
+                self.save_progress()        # 保存一下进度
+                self.log("All accounts are suspended, wating {} second then re-try ...".format(wait_time))
+                try:
+                    sleep(wait_time)
+                except (InterruptedError, KeyboardInterrupt):
+                    break
+                wait_time *= 2
+            else:
+                wait_time = self._wait_time
+            account = self._accounts[idx]
+            self.log("Using account {} to send emails".format(account['sender']))
+            with closing(Smtp(account)) as smtp:
+                force_quit, cnt = self._send_mail(smtp, no)
+            sent_cnt += cnt
+            no += cnt
+            if cnt == 0:
+                suspend_accounts.add(idx)
+            idx = (idx + 1) % len(self._accounts)
+
+        self.save_progress()
+
+        rest_total = sent_cnt + len(self._receivers)    # 本次任务剩下应发送的
+        all_cnt = len(self._sent)                  # 所有已发送的
+        all_total = all_cnt + len(self._receivers) # 所有应该发送的
+        self.log("Sent over. sent {}/{} ({:.2f}%), total {}/{} ({:.2f}%).".format(
+            sent_cnt, rest_total, 100 if rest_total == 0 else sent_cnt/rest_total * 100,
+            all_cnt, all_total, 100 if all_total == 0 else all_cnt/all_total * 100))
+
+        self.quit()
 
 
-def usage():
-    print("sendmail.py [<address-file>]")
+    def save_progress(self):
+        """保存已发送邮件的地址到
+        task_dir/progress/{sucess_sent,failed_sent,rest_receivers}.txt
+        文件里
+        """
+        progress_path = os.path.join(self._workdir, 'progress')
+        os.makedirs(progress_path, exist_ok=True)
+        sucess_path = os.path.join(progress_path, 'sucess_sent.txt')
+        rest_path = os.path.join(progress_path, 'rest_receivers.txt')
+        for file, addrs in [(sucess_path, self._sent),
+                (rest_path, self._receivers)]:
+            with open(file, 'w') as fp:
+                fp.write('\n'.join(addrs))
+
+    def load_progress(self):
+        progress_path = os.path.join(self._workdir, 'progress')
+        if not os.path.exists(progress_path):
+            return False
+
+        sucess_path = os.path.join(progress_path, 'sucess_sent.txt')
+        rest_path = os.path.join(progress_path, 'rest_receivers.txt')
+        if not os.path.exists(sucess_path) or not os.path.exists(rest_path):
+            return False
+        self._sent = set(Task._read_receivers(sucess_path))
+        # 合并邮件地址，以支持动态添加新地址
+        new_receivers = set(self._receivers)
+        rest_receivers = [x for x in Task._read_receivers(rest_path) if x not in new_receivers]
+        self._receivers += rest_receivers
+        return True
+
+    def clear_log(self):
+        self._log_fp.truncate(0)
+
+    def log(self, *values):
+        print(*values)
+        print(*values, file=self._log_fp)
+
+    def quit(self):
+        self._log_fp.close()
+
+
+    def _not_sent(self, addr):
+        return addr not in self._sent
+
+
+    def _send_mail(self, smtp, no):
+        sent_cnt = 0
+        force_quit = False
+        while self._receivers:
+            receiver = self._receivers.popleft()
+            if self._not_sent(receiver):
+                try:
+                    smtp.sendmail(receiver, self._message.to(receiver).as_string())
+                    pass
+                except Exception as e:
+                    self.log("{}. {} sent email to {} fail".format(no, smtp.sender, receiver), e)
+                    self._receivers.appendleft(receiver)
+                    break
+                self.log("{}. {} sent email to {}".format(no, smtp.sender, receiver))
+                no += 1
+                sent_cnt += 1
+                self._sent.add(receiver)
+
+                try:
+                    # 等待 self._time_out 秒，再发送下一封邮件
+                    sleep(self._time_out)
+                except (InterruptedError, KeyboardInterrupt):
+                    force_quit = True
+                    break
+
+        return force_quit, sent_cnt
+
+
+    @staticmethod
+    def _read_receivers(file):
+        with open(file) as fp:
+            return [addr.strip() for addr in fp.readlines()]
+
+    @staticmethod
+    def _merge_receivers(addresses):
+        receivers = []
+
+        for addr in addresses:
+            if addr.startswith('@'):
+                receivers += Task._read_receivers(addr[1:])
+            else:
+                receivers.append(addr)
+        return receivers
+
+
+def args_parser():
+    parser = argparse.ArgumentParser(description='给批量用户发送邮件')
+    parser.add_argument('-t', '--task',
+            action='store',
+            required=True,
+            help="运行指定的任务")
+    parser.add_argument('-n', '--new-task',
+            action='store_true',
+            default=False,
+            help="如果任务保存得有进度，仍然重新开始运行任务 (默认继续运行任务)")
+    return parser.parse_args()
+
+
+def main():
+    args = args_parser()
+
+    task_cfg = Task.load_config(args.task)
+    task = Task(task_cfg, args.task)
+    if args.new_task:
+        task.clear_log()
+    else:
+        ok = task.load_progress()
+        if not ok:
+            print("Start a new task")
+    task.run()
 
 
 if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        usage()
-        sys.exit(1)
-    main(sys.argv[1])
+    main()

@@ -10,18 +10,18 @@ import os
 import sys
 import shutil
 import zipfile
-from pathlib import Path
 from random import randint
 
 payment_keys = ['payment', '付款', '缴费', '支付', 'fee', 'receipt', '转账']
 paper_keys = ['paper', '论文', 'manuscript', 'camera', 'essay']
 report_keys = ['report', 'plagiarism', 'plagrism', '查重']
-other_keys = ['copyright']
+copyright_keys = ['copyright']
+other_keys = []
 
 def is_payment(fname):
     base_name = os.path.splitext(fname)[0].lower()
     ext = os.path.splitext(fname)[-1].lower()
-    exclude_keys = other_keys + paper_keys + report_keys
+    exclude_keys = paper_keys + report_keys + copyright_keys + other_keys
     if ext in ['.png', '.jpg', '.jpeg']:
         return True
     for key in exclude_keys:
@@ -49,6 +49,14 @@ def is_paper(fname, valid_exts=['.docx', '.doc', '.pdf'], invalid_exts=['.png', 
     if ext in valid_exts:
         return True
     return False
+
+
+def is_copyright(fname):
+    base_name = os.path.splitext(fname)[0].lower()
+    ext = os.path.splitext(fname)[-1].lower()
+    for key in copyright_keys:
+        if key in base_name:
+            return True
 
 
 def unzip(path, folderPath):
@@ -150,6 +158,10 @@ def main():
 
     distance_dir = make_random_dir()
     if 'paper' == mode:
+        filter_files(extract_dir, distance_dir, reserve=is_paper)
+    elif 'copyright' == mode:
+        filter_files(extract_dir, distance_dir, reserve=is_copyright)
+    elif 'camera' == mode:
         filter_files(extract_dir, distance_dir, reserve=is_camera)
     elif 'payment' == mode:
         filter_files(extract_dir, distance_dir, reserve=is_payment, unique=False)
