@@ -114,6 +114,7 @@ class Task:
         self._accounts = cfg.accounts
         self._receivers = deque(Task._merge_receivers(cfg.address))
         self._sent = set()
+        self._failed = set()
         self._message = Message(self._email['from'], self._email['subject'],
                 _parse_and_read(self._email['context']),
                 self._email['attaches'], self._email['reply-to'])
@@ -141,11 +142,12 @@ class Task:
         return task
 
     def run(self):
-        no = len(self._sent)+1
+        no = len(self._sent) + len(self._failed) + 1
         idx = 0
         suspend_accounts = set()
         wait_time = self._wait_time
         sent_cnt = 0
+        failed_cnt = 0
         force_quit = False
         while self._receivers and not force_quit:
             if len(suspend_accounts) == len(self._accounts):
@@ -157,25 +159,27 @@ class Task:
                 except (InterruptedError, KeyboardInterrupt):
                     break
                 wait_time *= 2
-            else:
-                wait_time = self._wait_time
             account = self._accounts[idx]
             self.log("Using account {} to send emails".format(account['sender']))
             with closing(Smtp(account)) as smtp:
-                force_quit, cnt = self._send_mail(smtp, no)
-            sent_cnt += cnt
-            no += cnt
-            if cnt == 0:
+                force_quit, cnt, cnt2 = self._send_mail(smtp, no)
+            if cnt + cnt2 == 0:
                 suspend_accounts.add(idx)
+            else:
+                wait_time = self._wait_time
+            sent_cnt += cnt
+            failed_cnt += cnt2
+            no += cnt + cnt2
             idx = (idx + 1) % len(self._accounts)
 
         self.save_progress()
 
-        rest_total = sent_cnt + len(self._receivers)    # 本次任务剩下应发送的
+        rest_total = sent_cnt + failed_cnt + len(self._receivers)  # 本次任务剩下应发送的
         all_cnt = len(self._sent)                  # 所有已发送的
         all_total = all_cnt + len(self._receivers) # 所有应该发送的
         self.log("Sent over. sent {}/{} ({:.2f}%), total {}/{} ({:.2f}%).".format(
-            sent_cnt, rest_total, 100 if rest_total == 0 else sent_cnt/rest_total * 100,
+            sent_cnt + failed_cnt, rest_total,
+            100 if rest_total == 0 else (sent_cnt + failed_cnt)/rest_total * 100,
             all_cnt, all_total, 100 if all_total == 0 else all_cnt/all_total * 100))
 
         self.quit()
@@ -189,22 +193,28 @@ class Task:
         progress_path = os.path.join(self._workdir, 'progress')
         os.makedirs(progress_path, exist_ok=True)
         sucess_path = os.path.join(progress_path, 'sucess_sent.txt')
+        failed_path = os.path.join(progress_path, 'failed_sent.txt')
         rest_path = os.path.join(progress_path, 'rest_receivers.txt')
         for file, addrs in [(sucess_path, self._sent),
+                (failed_path, self._failed),
                 (rest_path, self._receivers)]:
             with open(file, 'w') as fp:
                 fp.write('\n'.join(addrs))
 
     def load_progress(self):
         progress_path = os.path.join(self._workdir, 'progress')
-        if not os.path.exists(progress_path):
+        if not os.path.isdir(progress_path):
             return False
 
         sucess_path = os.path.join(progress_path, 'sucess_sent.txt')
+        failed_path = os.path.join(progress_path, 'failed_sent.txt')
         rest_path = os.path.join(progress_path, 'rest_receivers.txt')
-        if not os.path.exists(sucess_path) or not os.path.exists(rest_path):
+        if (not os.path.isfile(sucess_path)
+                or not os.path.isfile(failed_path)
+                or not os.path.isfile(rest_path)):
             return False
         self._sent = set(Task._read_receivers(sucess_path))
+        self._failed = set(Task._read_receivers(failed_path))
         # 合并邮件地址，以支持动态添加新地址
         new_receivers = set(self._receivers)
         rest_receivers = [x for x in Task._read_receivers(rest_path) if x not in new_receivers]
@@ -223,21 +233,31 @@ class Task:
 
 
     def _not_sent(self, addr):
-        return addr not in self._sent
+        return addr not in self._sent and addr not in self._failed
 
 
     def _send_mail(self, smtp, no):
         sent_cnt = 0
+        failed_cnt = 0
         force_quit = False
         while self._receivers:
             receiver = self._receivers.popleft()
             if self._not_sent(receiver):
                 try:
                     smtp.sendmail(receiver, self._message.to(receiver).as_string())
-                    pass
+                    #raise Exception('for test')
+                except (InterruptedError, KeyboardInterrupt):
+                    self._receivers.appendleft(receiver)
+                    force_quit = True
+                    break
                 except Exception as e:
                     self.log("{}. {} sent email to {} fail".format(no, smtp.sender, receiver), e)
-                    self._receivers.appendleft(receiver)
+                    if isinstance(e, smtplib.SMTPRecipientsRefused) and 'User not found' in e.recipients:
+                        self.log("{}. {} sent email to invalid address {}".format(no, smtp.sender, receiver))
+                        self._failed.add(receiver)
+                        failed_cnt += 1
+                    else:
+                        self._receivers.appendleft(receiver)
                     break
                 self.log("{}. {} sent email to {}".format(no, smtp.sender, receiver))
                 no += 1
@@ -251,7 +271,7 @@ class Task:
                     force_quit = True
                     break
 
-        return force_quit, sent_cnt
+        return force_quit, sent_cnt, failed_cnt
 
 
     @staticmethod
