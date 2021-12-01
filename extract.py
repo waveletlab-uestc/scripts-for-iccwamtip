@@ -33,7 +33,7 @@ def is_payment(fname):
     return False
 
 def is_camera(fname):
-    return is_paper(fname, valid_exts=['.docx'], invalid_exts=['.pdf', '.png', '.jpg', '.jpeg'])
+    return is_paper(fname, valid_exts=['.docx', '.doc'], invalid_exts=['.pdf', '.png', '.jpg', '.jpeg'])
 
 def is_paper(fname, valid_exts=['.docx', '.doc', '.pdf'], invalid_exts=['.png', '.jpeg', 'jpg']):
     base_name = os.path.splitext(fname)[0].lower()
@@ -52,11 +52,9 @@ def is_paper(fname, valid_exts=['.docx', '.doc', '.pdf'], invalid_exts=['.png', 
 
 
 def is_copyright(fname):
-    base_name = os.path.splitext(fname)[0].lower()
-    ext = os.path.splitext(fname)[-1].lower()
-    for key in copyright_keys:
-        if key in base_name:
-            return True
+    stem_name = os.path.splitext(fname)[0].lower()
+    #ext = os.path.splitext(fname)[-1].lower()
+    return any(key in stem_name for key in copyright_keys)
 
 
 def unzip(path, folderPath):
@@ -72,7 +70,7 @@ def unzip(path, folderPath):
         zfile.extract(f, folderPath)
 
 
-def filter_files(src, dst, reserve=is_paper, unique=True):
+def filter_files(src, dst, keep=is_paper, unique=True):
     """
     将符合 reserve 条件的文件移动到 dst 目录下，通常情况下一个 id 内只有一个文件
     除非 unique 为 False
@@ -89,7 +87,7 @@ def filter_files(src, dst, reserve=is_paper, unique=True):
             id_ = path.split(os.path.sep)[1]
             true_name = path.split(os.path.sep)[-1]
             ext = os.path.splitext(true_name)[-1].lower()
-            if reserve(true_name):
+            if keep(true_name):
                 if id_ in ids and unique:
                     continue
                 if id_ in ids:
@@ -129,7 +127,7 @@ def make_random_dir():
 
 
 def usage():
-    print("extract.py [paper|payment] {sources.zip} {destination.zip}")
+    print("extract.py [paper|payment|copyright|camera] {sources.zip} {destination.zip}")
     print("e.g. extract.py paper Submission.zip papers.zip")
 
 
@@ -157,14 +155,16 @@ def main():
     unzip(source_zip, extract_dir)
 
     distance_dir = make_random_dir()
+    # 对于提交的论文同时有word和pdf版本，一起提取出来
     if 'paper' == mode:
-        filter_files(extract_dir, distance_dir, reserve=is_paper)
+        filter_files(extract_dir, distance_dir, keep=is_paper, unique=False)
     elif 'copyright' == mode:
-        filter_files(extract_dir, distance_dir, reserve=is_copyright)
+        filter_files(extract_dir, distance_dir, keep=is_copyright)
+    # 终稿只提取 word 文档
     elif 'camera' == mode:
-        filter_files(extract_dir, distance_dir, reserve=is_camera)
+        filter_files(extract_dir, distance_dir, keep=is_camera)
     elif 'payment' == mode:
-        filter_files(extract_dir, distance_dir, reserve=is_payment, unique=False)
+        filter_files(extract_dir, distance_dir, keep=is_payment, unique=False)
     else:
         print("Invalid mode")
         usage()

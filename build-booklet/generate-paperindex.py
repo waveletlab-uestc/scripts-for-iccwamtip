@@ -12,11 +12,12 @@ __doc__ = """
 """
 
 title = "Content of Proceeding of 17th ICCWAMTIP"
-tracks = OrderedDict({
-    'Theory and Experiment': 'theory-and-experiment.txt',
-    'Multimedia Technology': 'multimedia-technology.txt',
-    'Embedded System and Others': 'embedded-system-and-others.txt',
-})
+# Python 3.7 之后 dict 的 keys 保证和添加时顺序一致
+tracks = OrderedDict([
+    ('Theory and Experiment', 'theory-and-experiment.txt'),
+    ('Multimedia Technology', 'multimedia-technology.txt'),
+    ('Embedded System and Others', 'embedded-system-and-others.txt'),
+])
 
 def get_pages(doc):
     """获取 docx 文档的页数"""
